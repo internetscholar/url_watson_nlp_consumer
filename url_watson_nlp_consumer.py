@@ -1,135 +1,117 @@
 import requests
 from watson_developer_cloud.natural_language_understanding_v1 \
-    import Features, EntitiesOptions, KeywordsOptions, ConceptsOptions, MetadataOptions
+    import Features, EntitiesOptions, KeywordsOptions, ConceptsOptions, \
+    MetadataOptions, EmotionOptions, SentimentOptions
 from watson_developer_cloud import NaturalLanguageUnderstandingV1
 import boto3
 import json
 import psycopg2
 import configparser
 import os
-from urllib.parse import urlparse
+import logging
+from psycopg2 import extras
+import urllib3
+import traceback
 
-if __name__ == '__main__':
-    requests.packages.urllib3.disable_warnings()
+
+def main():
+    if 'DISPLAY' not in os.environ:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s')
+    else:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    ip = requests.get('http://checkip.amazonaws.com').text.rstrip()
     # Connect to Postgres server.
     config = configparser.ConfigParser()
     config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
     conn = psycopg2.connect(host=config['database']['host'],
-                            dbname=config['database']['dbname'],
+                            dbname=config['database']['db_name'],
                             user=config['database']['user'],
                             password=config['database']['password'])
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+    logging.info('Connected to database')
 
     # Retrieve AWS credentials and connect to Simple Queue Service (SQS).
     cur.execute("""select * from aws_credentials;""")
     aws_credential = cur.fetchone()
     aws_session = boto3.Session(
-        aws_access_key_id=aws_credential[0],
-        aws_secret_access_key=aws_credential[1],
-        region_name=aws_credential[2]
+        aws_access_key_id=aws_credential['aws_access_key_id'],
+        aws_secret_access_key=aws_credential['aws_secret_access_key'],
+        region_name=config['aws']['region_queues']
     )
     sqs = aws_session.resource('sqs')
-    credentials_queue = sqs.get_queue_by_name(QueueName='watson-credentials')
+    logging.info('Connected to AWS')
+    credentials_queue = sqs.get_queue_by_name(QueueName='watson_credentials')
 
     exhausted_credentials = False
     received_credentials = credentials_queue.receive_messages()
-    if len(received_credentials) == 0:
-        exhausted_credentials = True
-    else:
+    if len(received_credentials) != 0:
         credentials = json.loads(received_credentials[0].body)
         received_credentials[0].delete()
+        logging.info('Acquired credential')
         natural_language_understanding = NaturalLanguageUnderstandingV1(
             username=credentials['username'],
             password=credentials['password'],
             version='2018-03-16')
-
-    queue_empty = False
-    queue = sqs.get_queue_by_name(QueueName='watson-urls')
-
-    while not queue_empty and not exhausted_credentials:
-        message = queue.receive_messages()
-        if len(message) == 0:
-            queue_empty = True
-        else:
-            received_message = json.loads(message[0].body)
-            message[0].delete()
-            urls = received_message['urls']
-            while urls != []:
-                url = urls.pop(0)
-                insert_record = True
-                final_url = None
-                status_code = 0
-                error = None
-                headers = None
-                parsed_url = None
-                watson = None
-                try:
-                    r = requests.head(url, allow_redirects=True, verify=False, timeout=10)
-                    final_url = r.url
-                    status_code = r.status_code
-                    headers = r.headers
-
-                    if status_code == 403 or \
-                            (status_code == 200 and ('text/html' in r.headers['Content-Type'] or 'text/plain' in r.headers['Content-Type'])):
+        logging.info('Connected to Watson')
+        queue_empty = False
+        record = None
+        queue = sqs.get_queue_by_name(QueueName='url_watson_nlp')
+        try:
+            while not queue_empty and not exhausted_credentials:
+                message = queue.receive_messages()
+                if len(message) == 0:
+                    queue_empty = True
+                else:
+                    received_message = json.loads(message[0].body)
+                    message[0].delete()
+                    logging.info('Going to process %d URLs', len(received_message))
+                    for record in received_message:
+                        logging.info('Going to process URL %s - %s', record['project_name'], record['url'])
+                        error = None
                         try:
                             watson = natural_language_understanding.analyze(
-                                url=url,
-                                language=received_message['language'],
-                                features=Features(entities=EntitiesOptions(),
+                                url=record['url'],
+                                features=Features(entities=EntitiesOptions(sentiment=True, emotion=True),
                                                   concepts=ConceptsOptions(),
-                                                  keywords=KeywordsOptions(),
-                                                  metadata=MetadataOptions()),
+                                                  keywords=KeywordsOptions(sentiment=True, emotion=True),
+                                                  metadata=MetadataOptions(),
+                                                  emotion=EmotionOptions(),
+                                                  sentiment=SentimentOptions()),
                                 return_analyzed_text=True
                             )
                         except Exception as e:
-                            error = repr(e)
-                            if e.__class__.__name__ == 'WatsonApiException':
-                                if e.code == 429:
-                                    insert_record = False
-                                    urls.append(url)
-                                    received_credentials = credentials_queue.receive_messages()
-                                    if len(received_credentials) == 0:
-                                        exhausted_credentials = True
-                                        message_body = {
-                                            'query_alias': received_message['query_alias'],
-                                            'urls': urls
-                                        }
-                                        queue.send_message(MessageBody=json.dumps(message_body))
-                                    else:
-                                        credentials = json.loads(received_credentials[0].body)
-                                        received_credentials[0].delete()
-                                        natural_language_understanding = NaturalLanguageUnderstandingV1(
-                                            username=credentials['username'],
-                                            password=credentials['password'],
-                                            version='2018-03-16')
-                except Exception as e:
-                    error = repr(e)
-
-                if insert_record:
-                    if status_code < 400 and final_url is not None:
-                        parsed_url = urlparse(final_url)
-                    else:
-                        parsed_url = urlparse(url)
-                    parsed_url = json.dumps(dict(parsed_url._asdict()))
-
-                    if watson is not None:
+                            logging.info('Watch out! There is an error: %s', str(e))
+                            error = traceback.format_exc()
+                        logging.info('Success!')
                         watson = json.dumps(watson)
                         watson = watson.replace('\\u0000', ' ')
-                    if headers is not None:
-                        headers = json.dumps(dict(headers))
 
-                    cur.execute("""insert into watson
-                                    (query_alias, url, response, headers,
-                                    status_code, final_url, parsed_url)
-                                    values 
-                                    (%s, %s, %s, %s, %s, %s, %s)""",
-                                (received_message['query_alias'],
-                                 url,
-                                 watson,
-                                 headers,
-                                 status_code,
-                                 final_url,
-                                 parsed_url))
-                    conn.commit()
-
+                        cur.execute("""insert into url_watson_nlp
+                                        (url, project_name, response, error)
+                                        values 
+                                        (%s, %s, %s, %s)""",
+                                    (record['url'],
+                                     record['project_name'],
+                                     watson,
+                                     error,))
+                        conn.commit()
+                        logging.info('Saved on the database')
+        except Exception:
+            conn.rollback()
+            # add record indicating error.
+            cur.execute("insert into error (current_record, error, module, ip) VALUES (%s, %s, %s, %s)",
+                        (json.dumps(record),
+                         traceback.format_exc(),
+                         'url_watson_nlp_consumer',
+                         ip), )
+            logging.info('Saved record with error information')
+            conn.commit()
+            raise
     conn.close()
+    logging.info('Database closed')
+
+
+if __name__ == '__main__':
+    main()
