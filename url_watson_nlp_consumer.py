@@ -38,7 +38,7 @@ def main():
     aws_session = boto3.Session(
         aws_access_key_id=aws_credential['aws_access_key_id'],
         aws_secret_access_key=aws_credential['aws_secret_access_key'],
-        region_name=config['aws']['region_queues']
+        region_name=aws_credential['default_region']
     )
     sqs = aws_session.resource('sqs')
     logging.info('Connected to AWS')
@@ -84,6 +84,7 @@ def main():
                         except Exception as e:
                             logging.info('Watch out! There is an error: %s', str(e))
                             error = traceback.format_exc()
+                            watson = {}
                         logging.info('Success!')
                         watson = json.dumps(watson)
                         watson = watson.replace('\\u0000', ' ')
