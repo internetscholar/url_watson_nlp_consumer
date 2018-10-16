@@ -80,7 +80,7 @@ def main():
                                                   emotion=EmotionOptions(),
                                                   sentiment=SentimentOptions()),
                                 return_analyzed_text=True
-                            )
+                            ).get_result()
                         except Exception as e:
                             logging.info('Watch out! There is an error: %s', str(e))
                             error = traceback.format_exc()
